@@ -1,0 +1,7 @@
+[run]
+branch = True
+source = src/*
+include = src/*
+omit = */setup.py
+[report]
+include = src/*

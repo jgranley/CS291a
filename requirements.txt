@@ -1,0 +1,8 @@
+numpy
+scipy
+matplotlib
+pandas
+h5py
+pulse2percept
+scikit-image
+tensorflow
