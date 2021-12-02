@@ -11,9 +11,12 @@ from pulse2percept.implants import ArgusII
 
 
 def get_loss(model, implant, regularize=None, reg_coef=0.05):
-    axon_contrib = tf.constant(model.axon_contrib, dtype='float32')
-    x = tf.constant([implant[e].x for e in implant.electrodes])
-    y = tf.constant([implant[e].y for e in implant.electrodes])
+    bundles = model.grow_axon_bundles()
+    axons = model.find_closest_axon(bundles)
+    axon_contrib = model.calc_axon_sensitivity(axons, pad=True).astype(np.float32)
+    axon_contrib = tf.constant(axon_contrib, dtype='float32')
+    x = tf.constant([implant[e].x for e in implant.electrodes], dtype='float32')
+    y = tf.constant([implant[e].y for e in implant.electrodes], dtype='float32')
     rho = model.rho
     # get effect models. Need to reimplement them in tensorflow fashion
     def scale_threshold(pdur):
@@ -62,7 +65,8 @@ def get_loss(model, implant, regularize=None, reg_coef=0.05):
     # assumes model outputs same shape as ytrue
     def mse(ytrue, ypred):
         pred_imgs = biphasic_axon_map_batched(ypred)
-        return tf.reduce_mean((tf.reshape(pred_imgs, ytrue.shape) - ytrue)**2)
+        yt = tf.reshape(ytrue, pred_imgs.shape)
+        return tf.reduce_mean((pred_imgs - yt)**2, axis=-1)
     
     return mse
 
