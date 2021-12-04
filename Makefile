@@ -9,4 +9,4 @@ flake8:
 	@echo "flake8 passed"
 
 test:
-	py.test --pyargs src --cov-report term-missing --cov=src
+	py.test --pyargs cs291a --cov-report term-missing --cov=cs291a

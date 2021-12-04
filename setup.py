@@ -3,8 +3,8 @@ import os
 from setuptools import setup, find_packages
 PACKAGES = find_packages()
 
-# Get version and release info, which is all stored in src/version.py
-ver_file = os.path.join('src', 'version.py')
+# Get version and release info, which is all stored in cs291a/version.py
+ver_file = os.path.join('cs291a', 'version.py')
 with open(ver_file) as f:
     exec(f.read())
 

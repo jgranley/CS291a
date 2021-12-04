@@ -1,7 +1,7 @@
 [run]
 branch = True
-source = src/*
-include = src/*
+source = cs291a/*
+include = cs291a/*
 omit = */setup.py
 [report]
-include = src/*
+include = cs291a/*
