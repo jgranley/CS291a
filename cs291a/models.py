@@ -6,12 +6,13 @@ import keras
 import numpy as np
 from skimage.transform import resize
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import datetime
 import json
 import h5py
+import imageio
 
 import pulse2percept as p2p
 from pulse2percept.models import BiphasicAxonMapModel
@@ -97,7 +98,8 @@ def get_loss(model, implant, regularize=None, reg_coef=0.05, size_norm=False):
         yt = tf.reshape(ytrue, (-1, model.grid.shape[0] * model.grid.shape[1]))
         loss = tf.reduce_mean((pred_imgs - yt)**2, axis=-1) 
         if size_norm: # normalize by total number of pixels
-            loss /= tf.math.count_nonzero(yt, axis=-1)
+            loss /= tf.math.count_nonzero(yt, axis=-1, dtype='float32')
+            loss *= tf.cast(model.grid.shape[0] * model.grid.shape[1], 'float32')
         loss += reg_coef * regfn(ypred)
         return loss
     fn = mse
@@ -122,9 +124,6 @@ def get_model(implant, input_shape, num_dense=0, force_zero=False, sigmoid=False
     x = layers.Flatten()(x)
     for i in range(num_dense):
         x = layers.Dense(500, activation='relu')(x)
-    if sigmoid:
-        mask = layers.Dense(len(implant.electrodes, activation='sigmoid'))(x)
-        x = x * mask
     amps = layers.Dense(len(implant.electrodes))(x)
     amps = layers.ReLU()(amps)
     if force_zero:
@@ -138,15 +137,20 @@ def get_model(implant, input_shape, num_dense=0, force_zero=False, sigmoid=False
     if force_zero:
         pdurs = tf.where(amps >= 0.5, pdurs, tf.zeros_like(pdurs))
     outputs = tf.stack([freqs, amps, pdurs], axis=-1)
+    if sigmoid:
+        mask = layers.Dense(len(implant.electrodes), activation='sigmoid')(x)
+        outputs = outputs * mask[:, :, None]
     
     model = keras.Model(inputs=inputs, outputs=outputs)
     return model
 
 
 def train_model(nn, model, implant, reg, targets, stims, reg_coef, datatype, opt, learning_rate, 
-                batch_size=32, num_dense=0, force_zero=False, sigmoid=False, size_norm=False):
+                batch_size=32, num_dense=0, force_zero=False, sigmoid=False, size_norm=False, fonts='all'):
     data_dir = "../data"
     results_folder = os.path.join("../results", datatype)
+    if not os.path.exists(results_folder):
+        os.mkdir(results_folder)
 
     ex = np.array([implant[e].x for e in implant.electrodes], dtype='float32')
     ey = np.array([implant[e].y for e in implant.electrodes], dtype='float32')
@@ -163,12 +167,12 @@ def train_model(nn, model, implant, reg, targets, stims, reg_coef, datatype, opt
     loss_reg.__name__ = str(reg)
 
     dt = datetime.datetime.now().strftime("%m%d-%H%M%S")
-    modelname = (f"nn"
+    modelname = (f"nn_size"
                 f"_{len(implant.electrodes)}elecs"
                 f"_{opt}_lr{learning_rate}"
                 f"_{str(reg)}_"
                 + dt)
-    log_dir = "../results/tensorboard/" + modelname 
+    log_dir = os.path.join("../results/tensorboard/", datatype, modelname)
     modelpath = os.path.join(results_folder, modelname)
 
     tb = tf.keras.callbacks.TensorBoard(log_dir=log_dir)
@@ -209,53 +213,56 @@ def train_model(nn, model, implant, reg, targets, stims, reg_coef, datatype, opt
     json.dump(info, open(json_path, 'w'))
 
     # plot some images
-    if not os.path.exists(os.path.join(results_folder, 'predicted_images')):
-        os.mkdir(os.path.join(results_folder, 'predicted_images'))
-    ims_per_row = 15
-    rows = 2
-    fig, axes = plt.subplots(nrows = rows*2, ncols=ims_per_row, figsize=(20, 20))
-    fig.subplots_adjust(wspace=0, hspace=-0.75)
-    # predicted first
-    for i in range(rows):
-        for j in range(ims_per_row):
-            if j == 1:
-                plt.ylabel("Preds", fontweight="bold", fontsize=20)
-            plt.sca(axes[2*i][j])
-            idx = i * ims_per_row + j
-            pred = nn(targets_test[idx:idx+1]).numpy()
-            score = float(lossfn(targets_test[idx:idx+1], pred).numpy())
-            pred_img = model._predict_spatial_jax(pred[0], ex, ey)
-            plt.imshow(pred_img.reshape(model.grid.shape), cmap='gray')
-            plt.annotate(f"{str(round(score, 3))}", (1, 6), color='white')
-            plt.yticks([])
-            plt.xticks([])
-            axes[2*i][j].spines['bottom'].set_color('gray')
-            axes[2*i][j].spines['top'].set_color('gray')
-            axes[2*i][j].spines['right'].set_color('gray')
-            axes[2*i][j].spines['left'].set_color('gray')
-            axes[2*i][j].spines['bottom'].set_linewidth(2)
-            axes[2*i][j].spines['top'].set_linewidth(1)
-            axes[2*i][j].spines['right'].set_linewidth(2)
-            axes[2*i][j].spines['left'].set_linewidth(2)
-            # plt.axis(False)
-    for i in range(rows):
-        for j in range(ims_per_row):
-            if j == 1:
-                plt.ylabel("True", fontweight="bold", fontsize=20)
-            plt.sca(axes[2*i+1][j])
-            idx = i * ims_per_row + j
-            plt.imshow(targets_test[idx], cmap='gray')
-            # plt.axis(False)
-            plt.yticks([])
-            plt.xticks([])
-            axes[2*i+1][j].spines['bottom'].set_color('gray')
-            axes[2*i+1][j].spines['top'].set_color('gray')
-            axes[2*i+1][j].spines['right'].set_color('gray')
-            axes[2*i+1][j].spines['left'].set_color('gray')
-            axes[2*i+1][j].spines['bottom'].set_linewidth(2)
-            axes[2*i+1][j].spines['top'].set_linewidth(1)
-            axes[2*i+1][j].spines['right'].set_linewidth(2)
-            axes[2*i+1][j].spines['left'].set_linewidth(2)
+    if data_type == 'percepts' or data_type == 'alphabet':
+        if not os.path.exists(os.path.join(results_folder, 'predicted_images')):
+            os.mkdir(os.path.join(results_folder, 'predicted_images'))
+        ims_per_row = 15
+        rows = 2
+        fig, axes = plt.subplots(nrows = rows*2, ncols=ims_per_row, figsize=(20, 20))
+        fig.subplots_adjust(wspace=0, hspace=-0.75)
+        # predicted first
+        for i in range(rows):
+            for j in range(ims_per_row):
+                if j == 1:
+                    plt.ylabel("Preds", fontweight="bold", fontsize=20)
+                plt.sca(axes[2*i][j])
+                idx = i * ims_per_row + j
+                pred = nn(targets_train[idx:idx+1]).numpy()
+                score = float(lossfn(targets_train[idx:idx+1], pred).numpy())
+                pred_img = model._predict_spatial_jax(pred[0], ex, ey)
+                plt.imshow(pred_img.reshape(model.grid.shape), cmap='gray')
+                plt.annotate(f"{str(round(score, 3))}", (1, 6), color='white')
+                plt.yticks([])
+                plt.xticks([])
+                axes[2*i][j].spines['bottom'].set_color('gray')
+                axes[2*i][j].spines['top'].set_color('gray')
+                axes[2*i][j].spines['right'].set_color('gray')
+                axes[2*i][j].spines['left'].set_color('gray')
+                axes[2*i][j].spines['bottom'].set_linewidth(2)
+                axes[2*i][j].spines['top'].set_linewidth(1)
+                axes[2*i][j].spines['right'].set_linewidth(2)
+                axes[2*i][j].spines['left'].set_linewidth(2)
+                # plt.axis(False)
+        for i in range(rows):
+            for j in range(ims_per_row):
+                if j == 1:
+                    plt.ylabel("True", fontweight="bold", fontsize=20)
+                plt.sca(axes[2*i+1][j])
+                idx = i * ims_per_row + j
+                plt.imshow(targets_train[idx], cmap='gray')
+                # plt.axis(False)
+                plt.yticks([])
+                plt.xticks([])
+                axes[2*i+1][j].spines['bottom'].set_color('gray')
+                axes[2*i+1][j].spines['top'].set_color('gray')
+                axes[2*i+1][j].spines['right'].set_color('gray')
+                axes[2*i+1][j].spines['left'].set_color('gray')
+                axes[2*i+1][j].spines['bottom'].set_linewidth(2)
+                axes[2*i+1][j].spines['top'].set_linewidth(1)
+                axes[2*i+1][j].spines['right'].set_linewidth(2)
+                axes[2*i+1][j].spines['left'].set_linewidth(2)
+    elif data_type =='alphabet':
+        pass
     plt.savefig(os.path.join(results_folder, 'predicted_images', modelname + "_" + str(round(np.min(hist['val_loss']), 3)) +".png"), bbox_inches="tight")
 
     return round(np.min(hist['val_loss']), 4)
@@ -272,11 +279,34 @@ def read_h5(path):
     hf.close()
     return percepts, stims
 
+def load_alphabet(path, model, fonts=[i for i in range(31)]):
+    folders = os.listdir(path)
+    folders = [f for f in folders if f.isnumeric()]
+    targets = []
+    labels = []
+    for folder in folders:
+        letters = os.listdir(os.path.join(path, folder))
+        for font in fonts:
+            if str(font) + ".png" not in letters:
+                continue
+            img = imageio.imread(os.path.join(path, folder, str(font) + ".png"))
+            img = 255 - img # invert
+            img = resize(img, model.grid.shape, anti_aliasing=True)
+            img = 2 * img / 255. # rescale
+            targets.append(np.array(img, dtype='float32'))
+            labels.append(int(folder))
+
+    targets = np.array(targets, dtype='float32')
+    labels = np.array(labels)
+    return targets, labels
+
 if __name__ == "__main__":
     model = BiphasicAxonMapModel(axlambda=800, rho=200, a4=0, engine="jax", xystep=0.5, xrange=(-14, 12), yrange=(-12, 12))
     model.build()
     implant = ArgusII(rot=-30)
-
+    #####################################################################
+    #                            PERCEPTS                               #
+    #####################################################################
     data_type = 'percepts'
     h5_file = 'percepts_argusii_1elec_rho200lam800_12031654.h5'
     targets, stims = read_h5(os.path.join("../data", data_type, h5_file))
@@ -309,23 +339,52 @@ if __name__ == "__main__":
     #             best_force = force_zero
 
     # test regularization / coef
-    best_loss = 9999
-    for reg in ['l1', 'l2', 'l1_ampfreq', 'elecs']:
-        for coef in [0.005, 0.01]:
-            for lr, opt in zip([0.0001, 0.00005], ['adam', 'adam']):
-                nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False)
-                loss = train_model(nn, model, implant, reg, targets, stims, coef, data_type, opt, lr, num_dense=1, force_zero=False)
-                if loss < best_loss:
-                    best_loss = loss
-    sig = False
-    for lr, opt in zip([0.00002, 0.0001], ['sgd', 'adam']):
-        nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False, sigmoid=True)
-        loss = train_model(nn, model, implant, None, targets, stims, 0.0, data_type, opt, lr, num_dense=1, force_zero=False, sigmoid=True)
-        if loss < 0.07:
-            sig = True
+    # best_loss = 9999
+    # for reg in ['l1', 'l2', 'l1_ampfreq', 'elecs']:
+    #     for coef in [0.005, 0.01]:
+    #         for lr, opt in zip([0.0001, 0.00005], ['adam', 'adam']):
+    #             nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False)
+    #             loss = train_model(nn, model, implant, reg, targets, stims, coef, data_type, opt, lr, num_dense=1, force_zero=False)
+    #             if loss < best_loss:
+    #                 best_loss = loss
+    # sig = False
+    # for lr, opt in zip([ 0.00001], ['adam']):
+    #     nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False, sigmoid=True)
+    #     loss = train_model(nn, model, implant, None, targets, stims, 0.0, data_type, opt, lr, num_dense=1, force_zero=False, sigmoid=True)
+    #     if loss < 0.07:
+    #         sig = True
 
-    for lr, opt in zip([0.00001, 0.0001], ['sgd', 'adam']):
-        nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False, sigmoid=True)
-        loss = train_model(nn, model, implant, None, targets, stims, 0.0, data_type, opt, lr, num_dense=1, force_zero=False, sigmoid=sig, size_norm=True)
+    # for lr, opt in zip([0.00001], ['adam']):
+    #     for sig in [True, False]:
+    #         nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False, sigmoid=sig)
+    #         loss = train_model(nn, model, implant, 'elecs', targets, stims, 0.005 * 7.5, data_type, opt, lr, num_dense=1, force_zero=False, sigmoid=sig, size_norm=True)
 
-    print(best_loss)
+    # print(best_loss)
+
+    #####################################################################
+    #                            ALPHABET                               #
+    #####################################################################
+
+    data_type = 'alphabet'
+    letters, labels = load_alphabet("../data/alphabet", model)
+    targets = letters.reshape((-1, 49, 53, 1))
+
+    # test opts / learning rates
+    best_loss = 99999
+    best_opt = ""
+    best_lr = 999
+    for opt in ['sgd', 'adam']:
+        for lr in [0.000005, 0.00001, 0.0001, 0.001]:
+            nn = get_model(implant, targets[0].shape, num_dense=1)
+            loss = train_model(nn, model, implant, None, targets, stims, 0.005, data_type, opt, lr)
+            if loss < best_loss:
+                best_loss = loss
+                best_opt = opt
+                best_lr = lr
+
+    for n_dense in [0, 1, 3]:
+        nn = get_model(implant, targets[0].shape, num_dense=n_dense, force_zero=False)
+        loss = train_model(nn, model, implant, None, targets, stims, 0.005, data_type, best_opt, best_lr, num_dense=n_dense, force_zero=False)
+        if loss < best_loss:
+            best_loss = loss
+            best_ndense = n_dense
