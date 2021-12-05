@@ -1,3 +1,4 @@
+from matplotlib.colors import Normalize
 import tensorflow as tf
 from keras import backend as K
 from keras import layers
@@ -5,8 +6,12 @@ import keras
 import numpy as np
 from skimage.transform import resize
 import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
+import datetime
+import json
+import h5py
 
 import pulse2percept as p2p
 from pulse2percept.models import BiphasicAxonMapModel
@@ -14,10 +19,12 @@ from pulse2percept.stimuli import BiphasicPulseTrain
 from pulse2percept.utils import center_image
 from pulse2percept.implants import ArgusII
 
-from .dataset_gen import *
+# import dataset_gen
 
+# physical_devices = tf.config.list_physical_devices('GPU') 
+# tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
-def get_loss(model, implant, regularize=None, reg_coef=0.05):
+def get_loss(model, implant, regularize=None, reg_coef=0.05, size_norm=False):
     bundles = model.grow_axon_bundles()
     axons = model.find_closest_axon(bundles)
     axon_contrib = model.calc_axon_sensitivity(axons, pad=True).astype(np.float32)
@@ -43,19 +50,28 @@ def get_loss(model, implant, regularize=None, reg_coef=0.05):
         return tf.maximum(F_streak, min_f_streak)
 
     def reg_none(y_pred):
-        return tf.zeros((len(y_pred)))
+        return tf.zeros_like(y_pred[:, 0, 0])
     def reg_l1(y_pred):
+        return tf.reduce_sum(tf.abs(y_pred[:, :, 1]), axis=-1)
+    def reg_l1_ampfreq(y_pred):
         return tf.reduce_sum(tf.abs(y_pred[:, :, 1]), axis=-1) + tf.reduce_sum(tf.abs(y_pred[:, :, 0]), axis=-1)
     def reg_l2(y_pred):
         return tf.reduce_mean(y_pred[:, :, 1]**2, axis=-1)
+    def reg_elecs(y_pred):
+        return tf.math.count_nonzero((y_pred[:, :, 1] > 0.5), axis=-1, dtype='float32')
+
     if regularize is None:
-        reg = reg_none
+        regfn = reg_none
     elif regularize == 'l1':
-        reg = reg_l1
+        regfn = reg_l1
+    elif regularize == 'l1_ampfreq':
+        regfn = reg_l1_ampfreq
     elif regularize == 'l2':
-        reg = reg_l2
+        regfn = reg_l2
+    elif regularize == 'elecs':
+        regfn = reg_elecs
     else:
-        reg = reg_none
+        regfn = reg_none
 
     def biphasic_axon_map_batched(ypred):
         bright_effects = bright(ypred[:, :, 0], 
@@ -79,12 +95,16 @@ def get_loss(model, implant, regularize=None, reg_coef=0.05):
     def mse(ytrue, ypred):
         pred_imgs = biphasic_axon_map_batched(ypred)
         yt = tf.reshape(ytrue, (-1, model.grid.shape[0] * model.grid.shape[1]))
-        loss = tf.reduce_mean((pred_imgs - yt)**2, axis=-1) + reg_coef * reg(ypred)
+        loss = tf.reduce_mean((pred_imgs - yt)**2, axis=-1) 
+        if size_norm: # normalize by total number of pixels
+            loss /= tf.math.count_nonzero(yt, axis=-1)
+        loss += reg_coef * regfn(ypred)
         return loss
-    
+    fn = mse
+    fn.__name__ = 'loss_' + str(regularize)
     return tf.function(mse, jit_compile=True)
 
-def get_model(implant, input_shape, num_dense=0):
+def get_model(implant, input_shape, num_dense=0, force_zero=False, sigmoid=False):
     """ Makes a keras model for the model
     """
     inputs = layers.Input(shape=input_shape, dtype='float32')
@@ -102,81 +122,210 @@ def get_model(implant, input_shape, num_dense=0):
     x = layers.Flatten()(x)
     for i in range(num_dense):
         x = layers.Dense(500, activation='relu')(x)
+    if sigmoid:
+        mask = layers.Dense(len(implant.electrodes, activation='sigmoid'))(x)
+        x = x * mask
     amps = layers.Dense(len(implant.electrodes))(x)
     amps = layers.ReLU()(amps)
+    if force_zero:
+        amps = tf.where(amps >= 0.5, amps, tf.zeros_like(amps))
     freqs = layers.Dense(len(implant.electrodes))(x)
     freqs = layers.ReLU()(freqs)
-    # freqs = tf.where(amps >= 0.5, freqs, tf.zeros_like(freqs))
+    if force_zero:
+        freqs = tf.where(amps >= 0.5, freqs, tf.zeros_like(freqs))
     pdurs = layers.Dense(len(implant.electrodes))(x)
     pdurs = layers.ReLU()(pdurs) + 1e-3
-    # pdurs = tf.where(amps >= 0.5, pdurs, tf.zeros_like(pdurs))
+    if force_zero:
+        pdurs = tf.where(amps >= 0.5, pdurs, tf.zeros_like(pdurs))
     outputs = tf.stack([freqs, amps, pdurs], axis=-1)
     
     model = keras.Model(inputs=inputs, outputs=outputs)
     return model
 
 
-def train_model(nn, model, implant, reg, reg_coef, datatype, opt, learning_rate, batch_size=32, filename="", num_dense=0):
+def train_model(nn, model, implant, reg, targets, stims, reg_coef, datatype, opt, learning_rate, 
+                batch_size=32, num_dense=0, force_zero=False, sigmoid=False, size_norm=False):
     data_dir = "../data"
-    data_path = os.path.join(data_dir, datatype, filename)
     results_folder = os.path.join("../results", datatype)
 
     ex = np.array([implant[e].x for e in implant.electrodes], dtype='float32')
     ey = np.array([implant[e].y for e in implant.electrodes], dtype='float32')
 
-    targets, stims = read_h5(data_path)
-    targets = targets.reshape([-1] + list(model.grid.shape) + [1])
     targets_train, targets_test, stims_train, stims_test = train_test_split(targets, stims, test_size=0.2)
-    
     if opt == 'sgd':
         optimizer = tf.keras.optimizers.SGD(learning_rate=learning_rate)
     elif opt == 'adam':
         optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    lossfn = get_loss(model, implant, regularize=reg, reg_coef=reg_coef, size_norm=size_norm)
+    loss_noreg = get_loss(model, implant, size_norm=size_norm)
+    def loss_reg(y_true, y_pred):
+        return lossfn(y_true, y_pred) - loss_noreg(y_true, y_pred)
+    loss_reg.__name__ = str(reg)
 
-    lossfn = get_loss(model, implant, regularize=reg, reg_coef=reg_coef)
-
+    dt = datetime.datetime.now().strftime("%m%d-%H%M%S")
     modelname = (f"nn"
                 f"_{len(implant.electrodes)}elecs"
                 f"_{opt}_lr{learning_rate}"
-                f"_{str(reg)}")
-    log_dir = "../results/tensorboard/" + modelname + datetime.datetime.now().strftime("%m%d-%H%M%S")
-
+                f"_{str(reg)}_"
+                + dt)
+    log_dir = "../results/tensorboard/" + modelname 
     modelpath = os.path.join(results_folder, modelname)
+
     tb = tf.keras.callbacks.TensorBoard(log_dir=log_dir)
     cp = tf.keras.callbacks.ModelCheckpoint(modelpath, save_best_only=False)
-    es = tf.keras.callbacks.EarlyStopping(patience=30, monitor='loss')
-
-    nn.compile(optimizer=optimizer, loss=lossfn, metrics=[lossfn])
-    hist = model.fit(x=targets_train, y=targets_train, batch_size=batch_size, epochs=1000,
-                     callbacks=[tb, cp, es], validation_data=(targets_test, targets_test), validation_batch_size=32)
+    es = tf.keras.callbacks.EarlyStopping(patience=25, monitor='val_loss', restore_best_weights=True)
+    nn.compile(optimizer=optimizer, loss=lossfn, metrics=[loss_noreg, loss_reg])
+    hist = nn.fit(x=targets_train, y=targets_train, batch_size=batch_size, epochs=300,
+                     callbacks=[tb, es], validation_data=(targets_test, targets_test), validation_batch_size=32)
+    hist = hist.history
     
     # save_model
-    json_path = os.path.join(results_folder)
-    
+    print(f"done training {modelname}")
+    nn.save(modelpath)
+    json_path = os.path.join(results_folder, "info.json")
     if os.path.exists(json_path):
         info = json.load(open(json_path))
     else:
         info = {}
-    info[modelname] = {}
-    info[modelname]['test_loss'] = hist['val_loss'][-1]
-    info[modelname]['train_loss'] = hist['val_loss'][-1]
-    info[modelname]['epochs'] = len(hist['val_loss'])
-    info[modelname]['opt'] = opt
-    info[modelname]['lr'] = learning_rate
-    info[modelname]['reg'] = reg
-    info[modelname]['reg_coef'] = reg_coef
-    info[modelname]['batch_size'] = batch_size
-    info[modelname]['dense_layers'] = num_dense
-    info[modelname]['tensorboard_logdir'] = log_dir
-    info[modelname]['rho'] = model.rho
-    info[modelname]['lambda'] = model.axlambda
-    info[modelname]['n_elecs'] = len(implant.electrodes)
-    info[modelname]['shape'] = str(model.grid.shape)
-    info[modelname]['']
-    info[modelname]['']
+        info['1elec'] = {}
+    info['1elec'][modelname] = {}
+    info['1elec'][modelname]['test_loss'] = hist['val_loss'][-1]
+    info['1elec'][modelname]['train_loss'] = np.min(hist['val_loss'])
+    info['1elec'][modelname]['epochs'] = len(hist['val_loss'])
+    info['1elec'][modelname]['opt'] = opt
+    info['1elec'][modelname]['lr'] = learning_rate
+    info['1elec'][modelname]['reg'] = reg
+    info['1elec'][modelname]['reg_coef'] = reg_coef
+    info['1elec'][modelname]['batch_size'] = batch_size
+    info['1elec'][modelname]['dense_layers'] = num_dense
+    info['1elec'][modelname]['tensorboard_logdir'] = log_dir
+    info['1elec'][modelname]['rho'] = model.rho
+    info['1elec'][modelname]['lambda'] = model.axlambda
+    info['1elec'][modelname]['n_elecs'] = 1
+    info['1elec'][modelname]['shape'] = str(model.grid.shape)
+    info['1elec'][modelname]['force_good_stims'] = str(force_zero)
+    info['1elec'][modelname]['sigmoid'] = str(sigmoid)
+    info['1elec'][modelname]['size_norm'] = str(size_norm)
     json.dump(info, open(json_path, 'w'))
 
     # plot some images
     if not os.path.exists(os.path.join(results_folder, 'predicted_images')):
         os.mkdir(os.path.join(results_folder, 'predicted_images'))
-    
+    ims_per_row = 15
+    rows = 2
+    fig, axes = plt.subplots(nrows = rows*2, ncols=ims_per_row, figsize=(20, 20))
+    fig.subplots_adjust(wspace=0, hspace=-0.75)
+    # predicted first
+    for i in range(rows):
+        for j in range(ims_per_row):
+            if j == 1:
+                plt.ylabel("Preds", fontweight="bold", fontsize=20)
+            plt.sca(axes[2*i][j])
+            idx = i * ims_per_row + j
+            pred = nn(targets_test[idx:idx+1]).numpy()
+            score = float(lossfn(targets_test[idx:idx+1], pred).numpy())
+            pred_img = model._predict_spatial_jax(pred[0], ex, ey)
+            plt.imshow(pred_img.reshape(model.grid.shape), cmap='gray')
+            plt.annotate(f"{str(round(score, 3))}", (1, 6), color='white')
+            plt.yticks([])
+            plt.xticks([])
+            axes[2*i][j].spines['bottom'].set_color('gray')
+            axes[2*i][j].spines['top'].set_color('gray')
+            axes[2*i][j].spines['right'].set_color('gray')
+            axes[2*i][j].spines['left'].set_color('gray')
+            axes[2*i][j].spines['bottom'].set_linewidth(2)
+            axes[2*i][j].spines['top'].set_linewidth(1)
+            axes[2*i][j].spines['right'].set_linewidth(2)
+            axes[2*i][j].spines['left'].set_linewidth(2)
+            # plt.axis(False)
+    for i in range(rows):
+        for j in range(ims_per_row):
+            if j == 1:
+                plt.ylabel("True", fontweight="bold", fontsize=20)
+            plt.sca(axes[2*i+1][j])
+            idx = i * ims_per_row + j
+            plt.imshow(targets_test[idx], cmap='gray')
+            # plt.axis(False)
+            plt.yticks([])
+            plt.xticks([])
+            axes[2*i+1][j].spines['bottom'].set_color('gray')
+            axes[2*i+1][j].spines['top'].set_color('gray')
+            axes[2*i+1][j].spines['right'].set_color('gray')
+            axes[2*i+1][j].spines['left'].set_color('gray')
+            axes[2*i+1][j].spines['bottom'].set_linewidth(2)
+            axes[2*i+1][j].spines['top'].set_linewidth(1)
+            axes[2*i+1][j].spines['right'].set_linewidth(2)
+            axes[2*i+1][j].spines['left'].set_linewidth(2)
+    plt.savefig(os.path.join(results_folder, 'predicted_images', modelname + "_" + str(round(np.min(hist['val_loss']), 3)) +".png"), bbox_inches="tight")
+
+    return round(np.min(hist['val_loss']), 4)
+
+
+def read_h5(path):
+    if not os.path.exists(path):
+        raise ValueError("Provided path does not exist")
+    hf = h5py.File(path, 'r')
+    if 'stims' not in hf.keys() or 'percepts' not in hf.keys():
+        raise ValueError("H5 formatted incorrectly")
+    stims = np.array(hf.get('stims'), dtype='float32')
+    percepts = np.array(hf.get('percepts'), dtype='float32')
+    hf.close()
+    return percepts, stims
+
+if __name__ == "__main__":
+    model = BiphasicAxonMapModel(axlambda=800, rho=200, a4=0, engine="jax", xystep=0.5, xrange=(-14, 12), yrange=(-12, 12))
+    model.build()
+    implant = ArgusII(rot=-30)
+
+    data_type = 'percepts'
+    h5_file = 'percepts_argusii_1elec_rho200lam800_12031654.h5'
+    targets, stims = read_h5(os.path.join("../data", data_type, h5_file))
+    targets = targets.reshape((-1, 49, 53, 1))
+
+    # test opts / learning rates
+    # best_loss = 99999
+    # best_opt = ""
+    # best_lr = 999
+    # for opt in ['sgd', 'adam']:
+    #     for lr in [0.00001, 0.00005, 0.0001, 0.001]:
+    #         nn = get_model(implant, targets[0].shape)
+    #         loss = train_model(nn, model, implant, None, targets, stims, 0.005, data_type, opt, lr)
+    #         if loss < best_loss:
+    #             best_loss = loss
+    #             best_opt = opt
+    #             best_lr = lr
+                
+    # test architectures
+    # best_loss = 9999
+    # best_ndense = 0
+    # best_force = False
+    # for n_dense in [0, 1, 3]:
+    #     for force_zero in [True, False]:
+    #         nn = get_model(implant, targets[0].shape, num_dense=n_dense, force_zero=force_zero)
+    #         loss = train_model(nn, model, implant, None, targets, stims, 0.005, data_type, best_opt, best_lr, num_dense=n_dense, force_zero=force_zero)
+    #         if loss < best_loss:
+    #             best_loss = loss
+    #             best_ndense = n_dense
+    #             best_force = force_zero
+
+    # test regularization / coef
+    best_loss = 9999
+    for reg in ['l1', 'l2', 'l1_ampfreq', 'elecs']:
+        for coef in [0.005, 0.01]:
+            for lr, opt in zip([0.0001, 0.00005], ['adam', 'adam']):
+                nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False)
+                loss = train_model(nn, model, implant, reg, targets, stims, coef, data_type, opt, lr, num_dense=1, force_zero=False)
+                if loss < best_loss:
+                    best_loss = loss
+    sig = False
+    for lr, opt in zip([0.00002, 0.0001], ['sgd', 'adam']):
+        nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False, sigmoid=True)
+        loss = train_model(nn, model, implant, None, targets, stims, 0.0, data_type, opt, lr, num_dense=1, force_zero=False, sigmoid=True)
+        if loss < 0.07:
+            sig = True
+
+    for lr, opt in zip([0.00001, 0.0001], ['sgd', 'adam']):
+        nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False, sigmoid=True)
+        loss = train_model(nn, model, implant, None, targets, stims, 0.0, data_type, opt, lr, num_dense=1, force_zero=False, sigmoid=sig, size_norm=True)
+
+    print(best_loss)
