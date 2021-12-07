@@ -268,8 +268,8 @@ def train_model(nn, model, implant, reg, targets, stims, reg_coef, datatype, opt
                     plt.ylabel("Preds", fontweight="bold", fontsize=20)
                 plt.sca(axes[2*i][j])
                 idx = i * ims_per_row + j
-                pred = nn(targets_train[idx:idx+1]).numpy()
-                score = float(lossfn(targets_train[idx:idx+1], pred).numpy())
+                pred = nn(targets_test[idx:idx+1]).numpy()
+                score = float(lossfn(targets_test[idx:idx+1], pred).numpy())
                 pred_img = model._predict_spatial_jax(pred[0], ex, ey)
                 plt.imshow(pred_img.reshape(model.grid.shape), cmap='gray')
                 plt.annotate(f"{str(round(score, 3))}", (1, 6), color='white')
@@ -520,11 +520,11 @@ if __name__ == "__main__":
     #         loss = train_model(nn, model, implant, None, targets, labels, 0.005, data_type, opt, lr, loss_str=lossfn)
 
     # new model
-    model = BiphasicAxonMapModel(axlambda=1400, rho=80, a4=0, engine="jax", xystep=0.5, xrange=(-14, 12), yrange=(-12, 12))
-    model.build()
-    implant = ArgusII(rot=-30)
-    data_type = 'alphabet'
-    letters, labels = load_alphabet("../data/alphabet", model)
-    targets = letters.reshape((-1, 49, 53, 1))
-    nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False)
-    loss = train_model(nn, model, implant, None, targets, labels, 0.0, data_type, 'adam', 0.0002, num_dense=1, force_zero=False)
+    # model = BiphasicAxonMapModel(axlambda=1400, rho=80, a4=0, engine="jax", xystep=0.5, xrange=(-14, 12), yrange=(-12, 12))
+    # model.build()
+    # implant = ArgusII(rot=-30)
+    # data_type = 'alphabet'
+    # letters, labels = load_alphabet("../data/alphabet", model)
+    # targets = letters.reshape((-1, 49, 53, 1))
+    # nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False)
+    # loss = train_model(nn, model, implant, None, targets, labels, 0.0, data_type, 'adam', 0.0002, num_dense=1, force_zero=False)
