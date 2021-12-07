@@ -6,7 +6,7 @@ import keras
 import numpy as np
 from skimage.transform import resize
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import datetime
@@ -25,7 +25,7 @@ from pulse2percept.implants import ArgusII
 # physical_devices = tf.config.list_physical_devices('GPU') 
 # tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
-def get_loss(model, implant, regularize=None, reg_coef=0.05, size_norm=False):
+def get_loss(model, implant, regularize=None, reg_coef=0.05, size_norm=False, loss_fn='mse'):
     bundles = model.grow_axon_bundles()
     axons = model.find_closest_axon(bundles)
     axon_contrib = model.calc_axon_sensitivity(axons, pad=True).astype(np.float32)
@@ -57,7 +57,7 @@ def get_loss(model, implant, regularize=None, reg_coef=0.05, size_norm=False):
     def reg_l1_ampfreq(y_pred):
         return tf.reduce_sum(tf.abs(y_pred[:, :, 1]), axis=-1) + tf.reduce_sum(tf.abs(y_pred[:, :, 0]), axis=-1)
     def reg_l2(y_pred):
-        return tf.reduce_mean(y_pred[:, :, 1]**2, axis=-1)
+        return tf.reduce_sum(y_pred[:, :, 1]**2, axis=-1)
     def reg_elecs(y_pred):
         return tf.math.count_nonzero((y_pred[:, :, 1] > 0.5), axis=-1, dtype='float32')
 
@@ -102,11 +102,27 @@ def get_loss(model, implant, regularize=None, reg_coef=0.05, size_norm=False):
             loss *= tf.cast(model.grid.shape[0] * model.grid.shape[1], 'float32')
         loss += reg_coef * regfn(ypred)
         return loss
-    fn = mse
-    fn.__name__ = 'loss_' + str(regularize)
-    return tf.function(mse, jit_compile=True)
 
-def get_model(implant, input_shape, num_dense=0, force_zero=False, sigmoid=False):
+    def ms_ssim(ytrue, ypred):
+        pred_imgs = biphasic_axon_map_batched(ypred)
+        pred_imgs = tf.reshape(pred_imgs, (-1, model.grid.shape[0], model.grid.shape[1], 1))
+        ytrue = tf.reshape(ytrue, (-1, model.grid.shape[0], model.grid.shape[1], 1))
+
+        loss = 1 - tf.image.ssim_multiscale(ytrue, pred_imgs, 3, power_factors = (0.0448, 0.2856, 0.3001, 0.2363), filter_size=7)
+        loss += reg_coef * regfn(ypred)
+        return loss
+
+    if loss_fn == 'mse':
+        fn = mse
+        fn.__name__ = 'mse_' + str(regularize)
+        return tf.function(fn, jit_compile=True)
+    elif loss_fn == 'msssim':
+        fn = ms_ssim
+        fn.__name__ = 'msssim_' + str(regularize)
+        # cant jit msssim
+        return tf.function(fn) 
+
+def get_model(implant, input_shape, num_dense=0, force_zero=False, sigmoid=False, clip=False):
     """ Makes a keras model for the model
     """
     inputs = layers.Input(shape=input_shape, dtype='float32')
@@ -125,15 +141,30 @@ def get_model(implant, input_shape, num_dense=0, force_zero=False, sigmoid=False
     for i in range(num_dense):
         x = layers.Dense(500, activation='relu')(x)
     amps = layers.Dense(len(implant.electrodes))(x)
-    amps = layers.ReLU()(amps)
+    if clip == 'relu':
+        amps = layers.ReLU(max_value=10)(amps)
+    elif clip == 'sigmoid':
+        amps = layers.Activation('sigmoid')(amps) * 10.
+    else:
+        amps = layers.ReLU()(amps)
     if force_zero:
         amps = tf.where(amps >= 0.5, amps, tf.zeros_like(amps))
     freqs = layers.Dense(len(implant.electrodes))(x)
-    freqs = layers.ReLU()(freqs)
+    if clip == 'relu':
+        freqs = layers.ReLU(max_value=200)(freqs)
+    elif clip == 'sigmoid':
+        freqs = layers.Activation('sigmoid')(freqs) * 200.
+    else:
+        freqs = layers.ReLU()(freqs)
     if force_zero:
         freqs = tf.where(amps >= 0.5, freqs, tf.zeros_like(freqs))
     pdurs = layers.Dense(len(implant.electrodes))(x)
-    pdurs = layers.ReLU()(pdurs) + 1e-3
+    if clip == 'relu':
+        pdurs = layers.ReLU(max_value=100)(pdurs) + 1e-3
+    elif clip == 'sigmoid':
+        pdurs = layers.Activation('sigmoid')(pdurs) * 100. + 1e-3
+    else:
+        pdurs = layers.ReLU()(pdurs) + 1e-3
     if force_zero:
         pdurs = tf.where(amps >= 0.5, pdurs, tf.zeros_like(pdurs))
     outputs = tf.stack([freqs, amps, pdurs], axis=-1)
@@ -145,8 +176,8 @@ def get_model(implant, input_shape, num_dense=0, force_zero=False, sigmoid=False
     return model
 
 
-def train_model(nn, model, implant, reg, targets, stims, reg_coef, datatype, opt, learning_rate, 
-                batch_size=32, num_dense=0, force_zero=False, sigmoid=False, size_norm=False, fonts='all'):
+def train_model(nn, model, implant, reg, targets, stims, reg_coef, datatype, opt, learning_rate, clip=False,
+                batch_size=32, num_dense=0, force_zero=False, sigmoid=False, size_norm=False, fonts='all', loss_str='mse'):
     data_dir = "../data"
     results_folder = os.path.join("../results", datatype)
     if not os.path.exists(results_folder):
@@ -160,27 +191,30 @@ def train_model(nn, model, implant, reg, targets, stims, reg_coef, datatype, opt
         optimizer = tf.keras.optimizers.SGD(learning_rate=learning_rate)
     elif opt == 'adam':
         optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-    lossfn = get_loss(model, implant, regularize=reg, reg_coef=reg_coef, size_norm=size_norm)
-    loss_noreg = get_loss(model, implant, size_norm=size_norm)
+    else:
+        # can pass in custom optimizer
+        optimizer = opt
+    lossfn = get_loss(model, implant, regularize=reg, reg_coef=reg_coef, size_norm=size_norm, loss_fn=loss_str)
+    loss_noreg = get_loss(model, implant, size_norm=size_norm, loss_fn=loss_str)
     def loss_reg(y_true, y_pred):
         return lossfn(y_true, y_pred) - loss_noreg(y_true, y_pred)
     loss_reg.__name__ = str(reg)
 
     dt = datetime.datetime.now().strftime("%m%d-%H%M%S")
-    modelname = (f"nn_size"
+    modelname = (f"nn_{loss_str}"
                 f"_{len(implant.electrodes)}elecs"
                 f"_{opt}_lr{learning_rate}"
-                f"_{str(reg)}_"
+                f"_{str(reg)}_coef{str(reg_coef)}"
                 + dt)
     log_dir = os.path.join("../results/tensorboard/", datatype, modelname)
     modelpath = os.path.join(results_folder, modelname)
 
     tb = tf.keras.callbacks.TensorBoard(log_dir=log_dir)
     cp = tf.keras.callbacks.ModelCheckpoint(modelpath, save_best_only=False)
-    es = tf.keras.callbacks.EarlyStopping(patience=25, monitor='val_loss', restore_best_weights=True)
+    es = tf.keras.callbacks.EarlyStopping(patience=250, monitor='loss', restore_best_weights=True)
     nn.compile(optimizer=optimizer, loss=lossfn, metrics=[loss_noreg, loss_reg])
-    hist = nn.fit(x=targets_train, y=targets_train, batch_size=batch_size, epochs=300,
-                     callbacks=[tb, es], validation_data=(targets_test, targets_test), validation_batch_size=32)
+    hist = nn.fit(x=targets_train, y=targets_train, batch_size=batch_size, epochs=1000,
+                     callbacks=[ es], validation_data=(targets_test, targets_test), validation_batch_size=batch_size)
     hist = hist.history
     
     # save_model
@@ -192,24 +226,31 @@ def train_model(nn, model, implant, reg, targets, stims, reg_coef, datatype, opt
     else:
         info = {}
         info['1elec'] = {}
-    info['1elec'][modelname] = {}
-    info['1elec'][modelname]['test_loss'] = hist['val_loss'][-1]
-    info['1elec'][modelname]['train_loss'] = np.min(hist['val_loss'])
-    info['1elec'][modelname]['epochs'] = len(hist['val_loss'])
-    info['1elec'][modelname]['opt'] = opt
-    info['1elec'][modelname]['lr'] = learning_rate
-    info['1elec'][modelname]['reg'] = reg
-    info['1elec'][modelname]['reg_coef'] = reg_coef
-    info['1elec'][modelname]['batch_size'] = batch_size
-    info['1elec'][modelname]['dense_layers'] = num_dense
-    info['1elec'][modelname]['tensorboard_logdir'] = log_dir
-    info['1elec'][modelname]['rho'] = model.rho
-    info['1elec'][modelname]['lambda'] = model.axlambda
-    info['1elec'][modelname]['n_elecs'] = 1
-    info['1elec'][modelname]['shape'] = str(model.grid.shape)
-    info['1elec'][modelname]['force_good_stims'] = str(force_zero)
-    info['1elec'][modelname]['sigmoid'] = str(sigmoid)
-    info['1elec'][modelname]['size_norm'] = str(size_norm)
+        info['msssim'] = {}
+    if loss_str == 'mse':
+        dict_name = '1elec' # compatibility
+    elif loss_str == 'msssim':
+        dict_name = 'msssim'
+    info[dict_name][modelname] = {}
+    info[dict_name][modelname]['test_loss'] = np.min(hist['val_loss'])
+    info[dict_name][modelname]['train_loss'] = np.min(hist['loss'])
+    info[dict_name][modelname]['epochs'] = len(hist['val_loss'])
+    info[dict_name][modelname]['opt'] = opt
+    info[dict_name][modelname]['lr'] = learning_rate
+    info[dict_name][modelname]['reg'] = reg
+    info[dict_name][modelname]['reg_coef'] = reg_coef
+    info[dict_name][modelname]['batch_size'] = batch_size
+    info[dict_name][modelname]['dense_layers'] = num_dense
+    info[dict_name][modelname]['tensorboard_logdir'] = log_dir
+    info[dict_name][modelname]['rho'] = model.rho
+    info[dict_name][modelname]['lambda'] = model.axlambda
+    info[dict_name][modelname]['n_elecs'] = 1
+    info[dict_name][modelname]['shape'] = str(model.grid.shape)
+    info[dict_name][modelname]['force_good_stims'] = str(force_zero)
+    info[dict_name][modelname]['sigmoid'] = str(sigmoid)
+    info[dict_name][modelname]['size_norm'] = str(size_norm)
+    info[dict_name][modelname]['clip'] = clip
+    info[dict_name][modelname]['fonts'] = fonts
     json.dump(info, open(json_path, 'w'))
 
     # plot some images
@@ -290,15 +331,43 @@ def load_alphabet(path, model, fonts=[i for i in range(31)]):
             if str(font) + ".png" not in letters:
                 continue
             img = imageio.imread(os.path.join(path, folder, str(font) + ".png"))
-            img = 255 - img # invert
             img = resize(img, model.grid.shape, anti_aliasing=True)
-            img = 2 * img / 255. # rescale
+            img = 1 - img # invert
+            img = 2 * img # rescale
             targets.append(np.array(img, dtype='float32'))
             labels.append(int(folder))
 
     targets = np.array(targets, dtype='float32')
     labels = np.array(labels)
     return targets, labels
+
+def encode(target, implant, model, mode='amp', stimrange=(0, 2), maxval=None):
+    stim = []
+    if maxval is None:
+        maxval = np.max(target)
+    for elec in implant.electrodes:
+        # find location to sample
+        x_dva, y_dva = model.retinotopy.ret2dva(implant.electrodes[elec].x, implant.electrodes[elec].y)
+        # interpolate?
+        # print(x_dva, y_dva)
+        x_img = (x_dva - model.xrange[0]) / model.xystep
+        y_img = (y_dva - model.yrange[0]) / model.xystep
+        
+        x_img = int(round(x_img, ndigits=0))
+        y_img = int(round(y_img, ndigits=0))
+        # image is centered differently
+        # print(x_img, y_img)
+        # print()
+        px_intensity = target[y_img, x_img, 0]
+        stim_intensity = px_intensity / maxval * (stimrange[1] - stimrange[0]) + stimrange[0]
+        if stim_intensity < 0.5:
+            stim_intensity = 0
+            freq = 0
+        else:
+            freq = 20
+        pulse = np.array([freq, stim_intensity, 0.45], dtype='float32')
+        stim.append(pulse)
+    return np.array(stim, dtype='float32')
 
 if __name__ == "__main__":
     model = BiphasicAxonMapModel(axlambda=800, rho=200, a4=0, engine="jax", xystep=0.5, xrange=(-14, 12), yrange=(-12, 12))
@@ -311,7 +380,9 @@ if __name__ == "__main__":
     h5_file = 'percepts_argusii_1elec_rho200lam800_12031654.h5'
     targets, stims = read_h5(os.path.join("../data", data_type, h5_file))
     targets = targets.reshape((-1, 49, 53, 1))
-
+    # print(targets)
+    # print(targets.dtype)
+    # print(targets.shape)
     # test opts / learning rates
     # best_loss = 99999
     # best_opt = ""
@@ -361,30 +432,99 @@ if __name__ == "__main__":
 
     # print(best_loss)
 
+
+
     #####################################################################
     #                            ALPHABET                               #
     #####################################################################
 
+    # data_type = 'alphabet'
+    # letters, labels = load_alphabet("../data/alphabet", model)
+    # targets = letters.reshape((-1, 49, 53, 1))
+
+    # test opts / learning rates
+    # for opt in ['sgd', 'adam']:
+    #     for lr in [0.00001, 0.0001, 0.001]:
+    #         nn = get_model(implant, targets[0].shape, num_dense=1)
+    #         loss = train_model(nn, model, implant, None, targets, labels, 0.005, data_type, opt, lr)
+    #         if loss < best_loss:
+    #             best_loss = loss
+    #             best_opt = opt
+    #             best_lr = lr
+
+    # for n_dense in [0, 1, 3]:
+    #     nn = get_model(implant, targets[0].shape, num_dense=n_dense, force_zero=False)
+    #     loss = train_model(nn, model, implant, None, targets, labels, 0.005, data_type, best_opt, best_lr, num_dense=n_dense, force_zero=False)
+    #     if loss < best_loss:
+    #         best_loss = loss
+    #         best_ndense = n_dense
+
+    # test regularization / coef
+    # # best_loss = 9999
+    # for reg in ['l1', 'l2', 'l1_ampfreq', 'elecs']:
+    #     for coef in [0.05]:
+    #         for lr, opt in zip([0.0001], ['adam']):
+    #             nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False)
+    #             loss = train_model(nn, model, implant, reg, targets, labels, coef, data_type, opt, lr, num_dense=1, force_zero=False)
+                # if loss < best_loss:
+                #     best_loss = loss
+    # sig = False
+    # # sigmoid
+    # for lr, opt in zip([ 0.00001, 0.0001], ['adam', 'adam']):
+    #     nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False, sigmoid=True)
+    #     loss = train_model(nn, model, implant, None, targets, labels, 0.0, data_type, opt, lr, num_dense=1, force_zero=False, sigmoid=True)
+    #     if loss < 0.07:
+    #         sig = True
+
+    # for lr, opt in zip([0.00001], ['adam']):
+    #     for sig in [True, False]:
+    #         nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False, sigmoid=False)
+    #         loss = train_model(nn, model, implant, 'elecs', targets, labels, 0.005 * 7.5, data_type, opt, lr, num_dense=1, force_zero=False, sigmoid=False, size_norm=True)
+   
+    # nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False)
+    # loss = train_model(nn, model, implant, None, targets, labels, 0.0, data_type, 'adam', 0.0002, num_dense=1, force_zero=False)
+
+    # for clip in ['relu', 'sigmoid']:
+    #     nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False, clip=clip)
+    #     loss = train_model(nn, model, implant, None, targets, labels, 0.05, data_type, 'adam', 0.0001, num_dense=1, force_zero=False, clip=clip)
+
+
+    # for font in range(1, 31):
+    #     data_type = 'alphabet'
+    #     letters, labels = load_alphabet("../data/alphabet", model, fonts=[font])
+    #     targets = letters.reshape((-1, 49, 53, 1))
+    #     if len(targets) == 0:
+    #         continue
+    #     nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False, clip='relu')
+    #     loss = train_model(nn, model, implant, None, targets, labels, 0.0, data_type, 'adam', 0.0001, num_dense=1, force_zero=False, fonts=font, clip='relu', batch_size=16)
+
+    # for font in [28, 27, 26, 25, 21, 20, 10]:
+    #     data_type = 'alphabet'
+    #     letters, labels = load_alphabet("../data/alphabet", model, fonts=[font])
+    #     targets = letters.reshape((-1, 49, 53, 1))
+    #     if len(targets) == 0:
+    #         continue
+    #     nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False, clip='relu')
+    #     loss = train_model(nn, model, implant, 'l1', targets, labels, 0.0001, data_type, 'adam', 0.0001, num_dense=1, force_zero=False, fonts=font, clip='relu', batch_size=16)
+    
+
+    # ms-ssim
+    # data_type = 'alphabet'
+    # letters, labels = load_alphabet("../data/alphabet", model)
+    # targets = letters.reshape((-1, 49, 53, 1))
+
+    # lossfn = 'msssim'
+    # for opt in ['sgd', 'adam']:
+    #     for lr in [0.00001, 0.0001, 0.001]:
+    #         nn = get_model(implant, targets[0].shape, num_dense=1)
+    #         loss = train_model(nn, model, implant, None, targets, labels, 0.005, data_type, opt, lr, loss_str=lossfn)
+
+    # new model
+    model = BiphasicAxonMapModel(axlambda=1400, rho=80, a4=0, engine="jax", xystep=0.5, xrange=(-14, 12), yrange=(-12, 12))
+    model.build()
+    implant = ArgusII(rot=-30)
     data_type = 'alphabet'
     letters, labels = load_alphabet("../data/alphabet", model)
     targets = letters.reshape((-1, 49, 53, 1))
-
-    # test opts / learning rates
-    best_loss = 99999
-    best_opt = ""
-    best_lr = 999
-    for opt in ['sgd', 'adam']:
-        for lr in [0.000005, 0.00001, 0.0001, 0.001]:
-            nn = get_model(implant, targets[0].shape, num_dense=1)
-            loss = train_model(nn, model, implant, None, targets, stims, 0.005, data_type, opt, lr)
-            if loss < best_loss:
-                best_loss = loss
-                best_opt = opt
-                best_lr = lr
-
-    for n_dense in [0, 1, 3]:
-        nn = get_model(implant, targets[0].shape, num_dense=n_dense, force_zero=False)
-        loss = train_model(nn, model, implant, None, targets, stims, 0.005, data_type, best_opt, best_lr, num_dense=n_dense, force_zero=False)
-        if loss < best_loss:
-            best_loss = loss
-            best_ndense = n_dense
+    nn = get_model(implant, targets[0].shape, num_dense=1, force_zero=False)
+    loss = train_model(nn, model, implant, None, targets, labels, 0.0, data_type, 'adam', 0.0002, num_dense=1, force_zero=False)
